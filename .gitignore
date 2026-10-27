@@ -1,0 +1,24 @@
+# Android / Gradle
+.gradle/
+build/
+local.properties
+*.apk
+*.aab
+*.jks
+*.keystore
+.idea/
+*.iml
+captures/
+
+# Swift / macOS
+.build/
+*.app/
+.DS_Store
+
+# Receiver runtime data — never commit (contains PIN, QR, paired device tokens)
+status.json
+paired-devices.json
+pairing-qr*.png
+*.log
+.env
+.env.*
