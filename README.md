@@ -38,3 +38,23 @@ swiftc -O -parse-as-library -framework AVFoundation -framework AudioToolbox -fra
 ```
 
 `receiver/launchd/com.openbot.lanaudio.receiver.plist` is a LaunchAgent template; replace `YOUR_USER` with your macOS user name before installing it to `~/Library/LaunchAgents/`.
+
+## Project status
+
+**What it is:** Android sender app + macOS receiver that stream phone playback audio to a Mac over the LAN, with PIN/QR pairing, persistent paired devices, receiver discovery via Bonjour, and Mac volume control from the phone.
+
+**Verified (2026-10-28, macOS arm64, JDK 17, Android SDK 35):**
+
+| Check | Command | Result |
+|---|---|---|
+| Android unit tests, debug build, lint | `cd android && ./gradlew testDebugUnitTest assembleDebug lintDebug` | BUILD SUCCESSFUL |
+| Receiver compiles | `swiftc ... Receiver.swift CLIMain.swift` (see Quick start) | OK |
+| Pairing store (persistence, 0600 file, revoke) | `./android-imac-audio-receiver --test-pairing-store` | PASS |
+| Pairing QR generate/decode | `./android-imac-audio-receiver --test-qr` | PASS |
+
+**Not covered / limitations:**
+- No encryption: audio, PIN and paired token are plaintext on the LAN. Trusted private networks only; the sender accepts private/link-local IPs only.
+- Only a debug APK is built; no signed release and no CI. Install the APK yourself with `adb install`.
+- End-to-end Android-to-Mac audio and `--test-volume` (writes the Mac's system volume) were not re-run for this release. Android may capture silence from protected/DRM apps.
+- Receiver runtime data (PIN status file, QR image, `paired-devices.json`) lives in `~/Library/Application Support/OpenBot/LAN Audio Receiver/` and is never part of this repository.
+- No LICENSE file yet: all rights reserved until the owner adds one.
