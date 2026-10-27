@@ -39,26 +39,37 @@ import android.graphics.drawable.Drawable;
 import com.google.mlkit.vision.barcode.common.Barcode;
 import com.google.mlkit.vision.codescanner.GmsBarcodeScannerOptions;
 import com.google.mlkit.vision.codescanner.GmsBarcodeScanning;
-import java.net.InetAddress;
-import java.net.Inet6Address;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 public final class MainActivity extends Activity {
     private static final int CAPTURE_REQUEST = 40;
     private static final int RECORD_REQUEST = 41;
+    private static final int CONNECT = 0, CHOOSE_MAC = 1, PAIRING = 2, APP_PICKER = 3, SENDING = 4;
+    private int currentScreen = CONNECT;
+    private LinearLayout screenHost;
+    private LinearLayout stickyActions;
+    private View[] screens;
+    private TextView connectMac, connectMacState, sendingMac, sendingSource, sendingStatus;
+    private LinearLayout appPickerContent;
+    private EditText appSearchField;
+    private View legacyPin, legacyPairButton, legacyPairStatus, legacyUnpairButton, legacyCaptureNote, legacyConnectionStatus;
+    private String statusMessage = "Stopped";
+    private String activeSessionHost = "", activeSessionCaptureLabel = "";
+    private boolean failureDialogVisible;
     private final Handler handler = new Handler();
     private final Map<String, ReceiverDiscovery.Receiver> receivers = new LinkedHashMap<>();
     private final Map<String, ReceiverRow> receiverRows = new LinkedHashMap<>();
     private final List<PairedReceiver> pairedReceivers = new ArrayList<>();
     private EditText host, code;
-    private TextView portChip, selectedHint, discoveryStatus, validation, connectionStatus;
-    private TextView volumeStatus, volumeValue;
+    private TextView portChip, selectedHint, discoveryStatus, validation, connectionStatus, readiness;
+    private TextView volumeStatus, volumeValue, outputStatus;
     private TextView selectedAppLabel, appSelectionError;
     private TextView pairStatus;
     private LinearLayout receiverList;
@@ -67,13 +78,21 @@ public final class MainActivity extends Activity {
     private RadioGroup sourceModeGroup;
     private RadioButton allAppsRadio, oneAppRadio;
     private ProgressBar searchSpinner;
-    private Button scanButton, qrButton, startButton, stopButton, muteButton, changeAppButton, pairButton, unpairButton;
-    private LinearLayout volumePanel;
+    private Button scanButton, qrButton, startButton, stopButton, muteButton, changeAppButton, pairButton, unpairButton, manageOutputButton, volumeRetryButton;
+    private LinearLayout volumePanel, outputPanel;
     private SeekBar volumeSlider;
     private ReceiverDiscovery discovery;
     private final ExecutorService controlExecutor = Executors.newSingleThreadExecutor();
     private int confirmedVolume = -1, lastAudibleVolume = 50;
+    private String selectedOutputUid;
+    private boolean selectedOutputVolumeSettable;
+    private List<PairedReceiverClient.AudioOutput> audioOutputs = new ArrayList<>();
+    private boolean outputControlsUnsupported;
     private boolean changingVolume;
+    private boolean sendingControlsInitialized;
+    private final OutputListRequestState outputListRequestState = new OutputListRequestState();
+    private boolean outputListNeedsRetry;
+    private String activeSessionId;
     private CaptureApp selectedCaptureApp;
     private PairedReceiver pairedReceiver;
     private String pairingStoreError;
@@ -106,6 +125,12 @@ public final class MainActivity extends Activity {
     };
     private final BroadcastReceiver stateReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context context, Intent intent) {
+            String incomingSessionId = intent.getStringExtra("sessionId");
+            if (!ServiceStatePolicy.isCurrentSession(activeSessionId, incomingSessionId)) return;
+            if (activeSessionId == null) activeSessionId = incomingSessionId;
+            String host = intent.getStringExtra("host"), captureLabel = intent.getStringExtra("captureLabel");
+            if (host != null) activeSessionHost = host;
+            if (captureLabel != null) activeSessionCaptureLabel = captureLabel;
             setConnectionStatus(intent.getStringExtra("status"));
         }
     };
@@ -193,18 +218,29 @@ public final class MainActivity extends Activity {
         setConnectionStatus("Stopped");
         updateStartEnabled();
         beginScan();
+        showScreen(CONNECT);
+    }
+
+    @Override protected void onResume() {
+        super.onResume();
+        if (screenHost != null) startService(new Intent(this, AudioSenderService.class).setAction(AudioSenderService.ACTION_QUERY));
     }
 
     private View makeContent() {
+        LinearLayout screen = new LinearLayout(this);
+        screen.setOrientation(LinearLayout.VERTICAL);
+        screen.setBackgroundColor(Color.rgb(248, 249, 252));
+        screenHost = screen;
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
+        screen.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(24), dp(24), dp(24), dp(24));
+        root.setPadding(dp(20), dp(16), dp(20), dp(16));
         root.setBackgroundColor(Color.rgb(248, 249, 252));
         scroll.addView(root, new ScrollView.LayoutParams(-1, -2));
 
-        TextView title = text("Send audio to Mac", 24, true);
+        TextView title = text("Choose a Mac", 24, true);
         root.addView(title, params(-1, -2));
 
         TextView security = text("⚠  Trusted network only · Audio and pairing credentials are sent without encryption.", 15, false);
@@ -276,6 +312,28 @@ public final class MainActivity extends Activity {
         validation.setTextColor(Color.rgb(176, 39, 39));
         root.addView(validation, params(-1, -2));
 
+        Button useManualMac = new Button(this);
+        useManualMac.setText("Use this Mac");
+        root.addView(useManualMac, params(-1, dp(48)));
+        useManualMac.setOnClickListener(v -> {
+            String address = host.getText().toString().trim();
+            ReceiverAddress.ManualTargetAction action = ReceiverAddress.manualTargetAction(address, false, "");
+            if (action == ReceiverAddress.ManualTargetAction.INVALID) {
+                validation.setText("Enter a private or link-local IP address.");
+                host.requestFocus();
+                return;
+            }
+            pairedReceiver = null;
+            pairedReceiverFound = false;
+            selectedName = null;
+            updatePairingUi();
+            code.setText("");
+            pairStatus.setText("Enter the current six-digit pairing code from the Mac at " + address + ".");
+            validation.setText("");
+            showScreen(PAIRING);
+            code.requestFocus();
+        });
+
         code = field("6-digit pairing code", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
         code.setFilters(new InputFilter[]{new InputFilter.LengthFilter(6)});
         root.addView(code, params(-1, dp(54)));
@@ -291,6 +349,7 @@ public final class MainActivity extends Activity {
         root.addView(unpairButton, params(-1, dp(48)));
         pairButton.setOnClickListener(v -> pairCurrentReceiver());
         unpairButton.setOnClickListener(v -> confirmUnpair());
+        legacyPin = code; legacyPairButton = pairButton; legacyPairStatus = pairStatus; legacyUnpairButton = unpairButton;
 
         TextView sourceTitle = text("Audio source", 18, true);
         sourceTitle.setPadding(0, dp(8), 0, dp(2));
@@ -347,10 +406,12 @@ public final class MainActivity extends Activity {
         root.addView(sourceNote, params(-1, -2));
 
         TextView captureNote = text("Android asks for microphone permission for playback capture; this app does not record microphone audio. Some apps, including DRM/protected apps, may block capture and send silence.", 14, false);
+        legacyCaptureNote = captureNote;
         captureNote.setPadding(0, dp(8), 0, dp(8));
         root.addView(captureNote, params(-1, -2));
 
         connectionStatus = text("Stopped", 16, false);
+        legacyConnectionStatus = connectionStatus;
         connectionStatus.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         root.addView(connectionStatus, params(-1, dp(40)));
 
@@ -359,7 +420,25 @@ public final class MainActivity extends Activity {
         volumePanel.setPadding(dp(14), dp(10), dp(14), dp(10));
         volumePanel.setBackground(cardBackground(false));
         volumePanel.setVisibility(View.GONE);
-        TextView volumeTitle = text("Mac speaker volume", 16, true);
+        outputPanel = new LinearLayout(this);
+        outputPanel.setOrientation(LinearLayout.VERTICAL);
+        outputPanel.setPadding(dp(14), dp(10), dp(14), dp(10));
+        outputPanel.setBackground(cardBackground(false));
+        outputPanel.setVisibility(View.GONE);
+        outputPanel.addView(text("iMac audio output", 16, true), params(-1, -2));
+        outputStatus = text("Loading iMac audio outputs…", 14, false);
+        outputStatus.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
+        outputPanel.addView(outputStatus, params(-1, -2));
+        outputPanel.addView(text("Pair or remove Bluetooth devices in System Settings > Bluetooth on your Mac.", 14, false), params(-1, -2));
+        manageOutputButton = new Button(this);
+        manageOutputButton.setText("Manage output");
+        outputPanel.addView(manageOutputButton, params(-1, dp(48)));
+        manageOutputButton.setOnClickListener(v -> {
+            if (outputListNeedsRetry) loadOutputs();
+            else showOutputChoices();
+        });
+        root.addView(outputPanel, params(-1, -2));
+        TextView volumeTitle = text("iMac output volume", 16, true);
         volumePanel.addView(volumeTitle, params(-1, -2));
         LinearLayout volumeLine = new LinearLayout(this);
         volumeLine.setGravity(Gravity.CENTER_VERTICAL);
@@ -370,11 +449,22 @@ public final class MainActivity extends Activity {
         volumeLine.addView(volumeValue, new LinearLayout.LayoutParams(dp(56), -2));
         muteButton = new Button(this);
         muteButton.setText("Mute");
+        muteButton.setContentDescription("Mute iMac");
         volumeLine.addView(muteButton, new LinearLayout.LayoutParams(-2, dp(48)));
         volumePanel.addView(volumeLine, params(-1, dp(52)));
         volumeStatus = text("Connect to adjust Mac volume", 14, false);
         volumeStatus.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE);
         volumePanel.addView(volumeStatus, params(-1, -2));
+        volumeRetryButton = new Button(this); volumeRetryButton.setText("Try again"); volumeRetryButton.setVisibility(View.GONE);
+        volumePanel.addView(volumeRetryButton, params(-1, dp(48)));
+        volumeRetryButton.setOnClickListener(v -> {
+            volumeRetryButton.setEnabled(false);
+            if (outputListNeedsRetry && pairedReceiver != null) {
+                loadOutputs();
+            }
+            else if (confirmedVolume < 0) { if (pairedReceiver != null) loadOutputs(); else loadMacVolume(); }
+            else requestVolume(volumeSlider.getProgress());
+        });
         root.addView(volumePanel, params(-1, -2));
         volumeSlider.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
             @Override public void onProgressChanged(SeekBar bar, int value, boolean fromUser) {
@@ -387,7 +477,7 @@ public final class MainActivity extends Activity {
                 handler.postDelayed(sendVolumeChange, 250);
             }
         });
-        volumeSlider.setContentDescription("Mac speaker volume");
+        volumeSlider.setContentDescription("iMac output volume");
         muteButton.setOnClickListener(v -> {
             if (confirmedVolume > 0) requestVolume(0);
             else requestVolume(lastAudibleVolume);
@@ -395,10 +485,8 @@ public final class MainActivity extends Activity {
 
         startButton = new Button(this);
         startButton.setText("Start sending");
-        root.addView(startButton, params(-1, dp(56)));
         stopButton = new Button(this);
         stopButton.setText("Stop");
-        root.addView(stopButton, params(-1, dp(56)));
         stopButton.setEnabled(false);
 
         host.addTextChangedListener(new TextWatcher() {
@@ -429,7 +517,130 @@ public final class MainActivity extends Activity {
             startService(i);
             setConnectionStatus("Stopping…");
         });
+        stickyActions = new LinearLayout(this);
+        stickyActions.setOrientation(LinearLayout.VERTICAL);
+        stickyActions.setPadding(dp(20), dp(6), dp(20), dp(8));
+        stickyActions.setBackgroundColor(Color.WHITE);
+        readiness = text("Choose a Mac and audio source to start.", 14, false);
+        stickyActions.addView(readiness, params(-1, -2));
+        stickyActions.addView(startButton, params(-1, dp(56)));
+        stickyActions.addView(stopButton, params(-1, dp(56)));
+        screen.addView(stickyActions, new LinearLayout.LayoutParams(-1, -2));
+        View connect = makeConnectScreen();
+        screens = new View[]{connect, scroll, makePairingScreen(), makeAppPickerScreen(), makeSendingScreen()};
+        for (View oldControl : new View[]{legacyPin, legacyPairButton, legacyPairStatus, legacyUnpairButton, legacyCaptureNote, legacyConnectionStatus})
+            if (oldControl != null) oldControl.setVisibility(View.GONE);
+        screen.removeView(scroll);
+        screen.addView(connect, 0, new LinearLayout.LayoutParams(-1, 0, 1));
+        screen.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        for (int i = 2; i < screens.length; i++) screen.addView(screens[i], new LinearLayout.LayoutParams(-1, 0, 1));
+        for (View page : screens) page.setVisibility(View.GONE);
+        return screen;
+    }
+
+    private View makeConnectScreen() {
+        ScrollView scroll = new ScrollView(this); scroll.setFillViewport(true);
+        LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(dp(20), dp(16), dp(20), dp(16));
+        scroll.addView(root, new ScrollView.LayoutParams(-1, -2));
+        root.addView(text("LAN Audio", 24, true), params(-1, -2));
+        LinearLayout receiver = card();
+        connectMac = text("Choose a Mac", 18, true); receiver.addView(connectMac, params(-1, -2));
+        connectMacState = text("No receiver selected", 14, false); receiver.addView(connectMacState, params(-1, -2));
+        Button change = new Button(this); change.setText("Change"); receiver.addView(change, params(-1, dp(48)));
+        change.setOnClickListener(v -> { beginScan(); showScreen(CHOOSE_MAC); });
+        root.addView(receiver, params(-1, -2));
+        LinearLayout source = card(); source.addView(text("Audio source", 18, true), params(-1, -2));
+        detachFromParent(sourceModeGroup); detachFromParent(appChoiceRow); detachFromParent(appSelectionError);
+        source.addView(sourceModeGroup, params(-1, -2)); source.addView(appChoiceRow, params(-1, -2)); source.addView(appSelectionError, params(-1, -2));
+        root.addView(source, params(-1, -2));
+        root.addView(text("Android copies eligible playback audio. It does not mute audio on this phone. Some apps, including DRM-protected apps, may send silence.", 14, false), params(-1, -2));
+        LinearLayout warning = card(); warning.addView(text("⚠ Trusted network only. Audio and pairing details are not encrypted.", 14, false), params(-1, -2)); root.addView(warning, params(-1, -2));
         return scroll;
+    }
+
+    private View makePairingScreen() {
+        ScrollView scroll = new ScrollView(this); LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL); root.setPadding(dp(20), dp(16), dp(20), dp(16)); scroll.addView(root);
+        root.addView(text("Pair this Mac", 24, true), params(-1, -2));
+        pairStatus = text("Enter the current six-digit code from the Mac.", 14, false); root.addView(pairStatus, params(-1, -2));
+        code = field("6-digit pairing code", InputType.TYPE_CLASS_NUMBER | InputType.TYPE_NUMBER_VARIATION_PASSWORD);
+        code.setFilters(new InputFilter[]{new InputFilter.LengthFilter(6)});
+        code.addTextChangedListener(new TextWatcher() {
+            @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
+            @Override public void onTextChanged(CharSequence s, int start, int before, int count) {
+                updateStartEnabled();
+                if (pairButton != null) pairButton.setEnabled(pairedReceiver == null && pairingStoreError == null && PairingProtocol.isValidPin(s.toString()));
+            }
+            @Override public void afterTextChanged(Editable e) { }
+        });
+        root.addView(code, params(-1, dp(56)));
+        pairButton = new Button(this); pairButton.setText("Pair this Mac"); root.addView(pairButton, params(-1, dp(56))); pairButton.setOnClickListener(v -> pairCurrentReceiver());
+        Button once = new Button(this); once.setText("Use once"); root.addView(once, params(-1, dp(48)));
+        once.setOnClickListener(v -> { pairedReceiver = null; updatePairingUi(); updateStartEnabled(); showScreen(CONNECT); });
+        unpairButton = new Button(this); unpairButton.setText("Unpair this phone"); root.addView(unpairButton, params(-1, dp(48))); unpairButton.setOnClickListener(v -> confirmUnpair());
+        return scroll;
+    }
+
+    private View makeAppPickerScreen() {
+        LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(dp(20), dp(16), dp(20), dp(16));
+        root.addView(text("Choose one app", 24, true), params(-1, -2));
+        appSearchField = field("Search apps", InputType.TYPE_CLASS_TEXT); root.addView(appSearchField, params(-1, dp(56)));
+        root.addView(text("Only eligible playback from the selected app is copied. The app may block capture.", 14, false), params(-1, -2));
+        appPickerContent = new LinearLayout(this); appPickerContent.setOrientation(LinearLayout.VERTICAL);
+        root.addView(appPickerContent, new LinearLayout.LayoutParams(-1, 0, 1));
+        return root;
+    }
+
+    private View makeSendingScreen() {
+        LinearLayout screen = new LinearLayout(this); screen.setOrientation(LinearLayout.VERTICAL);
+        ScrollView scroll = new ScrollView(this); LinearLayout root = new LinearLayout(this); root.setOrientation(LinearLayout.VERTICAL); root.setPadding(dp(20), dp(16), dp(20), dp(16)); scroll.addView(root);
+        screen.addView(scroll, new LinearLayout.LayoutParams(-1, 0, 1));
+        root.addView(text("Sending", 24, true), params(-1, -2));
+        sendingMac = text("", 20, true); root.addView(sendingMac, params(-1, -2));
+        sendingSource = text("", 16, false); root.addView(sendingSource, params(-1, -2));
+        sendingStatus = text("Connecting…", 14, false); sendingStatus.setAccessibilityLiveRegion(View.ACCESSIBILITY_LIVE_REGION_POLITE); root.addView(sendingStatus, params(-1, -2));
+        detachFromParent(outputPanel); detachFromParent(volumePanel);
+        root.addView(outputPanel, params(-1, -2)); root.addView(volumePanel, params(-1, -2));
+        Button stop = stopButton; detachFromParent(stop); stop.setText("Stop sending");
+        stop.setPadding(dp(20), dp(6), dp(20), dp(8));
+        screen.addView(stop, params(-1, dp(64)));
+        stop.setOnClickListener(v -> { startService(new Intent(this, AudioSenderService.class).setAction(AudioSenderService.ACTION_STOP)); setConnectionStatus("Stopping…"); });
+        return screen;
+    }
+
+    private void detachFromParent(View view) {
+        if (view != null && view.getParent() instanceof ViewGroup) ((ViewGroup)view.getParent()).removeView(view);
+    }
+
+    private void showScreen(int screen) {
+        currentScreen = screen;
+        if (screens != null) for (int i = 0; i < screens.length; i++) screens[i].setVisibility(i == screen ? View.VISIBLE : View.GONE);
+        if (stickyActions != null) stickyActions.setVisibility(screen == CONNECT ? View.VISIBLE : View.GONE);
+        if (screen == CONNECT) refreshConnectSummary();
+        if (screen == SENDING) {
+            sendingMac.setText("Sending to " + currentMacName());
+            sendingSource.setText(oneAppMode && selectedCaptureApp != null ? "Only " + selectedCaptureApp.label
+                    : !activeSessionCaptureLabel.isEmpty() && !"All compatible apps".equals(activeSessionCaptureLabel) ? "Only " + activeSessionCaptureLabel : "All compatible apps");
+            sendingStatus.setText(statusMessage);
+        }
+    }
+
+    @Override public void onBackPressed() {
+        if (currentScreen == SENDING && connectionActive) Toast.makeText(this, "Stop sending to end the current session.", Toast.LENGTH_SHORT).show();
+        else if (currentScreen == SENDING) showScreen(CONNECT);
+        else if (currentScreen == PAIRING) showScreen(CHOOSE_MAC);
+        else if (currentScreen == APP_PICKER || currentScreen == CHOOSE_MAC) showScreen(CONNECT);
+        else super.onBackPressed();
+    }
+
+    private String currentMacName() { return pairedReceiver != null ? pairedReceiver.receiverName : selectedName != null ? selectedName : !activeSessionHost.isEmpty() ? activeSessionHost : host.getText().toString(); }
+    private void refreshConnectSummary() {
+        if (connectMac == null) return;
+        connectMac.setText(currentMacName().isEmpty() ? "Choose a Mac" : currentMacName());
+        connectMacState.setText(pairedReceiver != null ? (pairedReceiverFound ? "Paired · Available" : "Paired · Not found on this network") : "Not paired · Enter the current code");
+        readiness.setText(isLanAddress(host.getText().toString().trim()) && (pairedReceiver != null || code.getText().toString().matches("\\d{6}"))
+                ? "Ready · " + currentMacName() + " · " + (oneAppMode && selectedCaptureApp != null ? selectedCaptureApp.label : "All compatible apps")
+                : "Choose a Mac and audio source to start.");
     }
 
     private void beginScan() {
@@ -478,6 +689,7 @@ public final class MainActivity extends Activity {
         refreshSelectedRows();
         updatePairingUi();
         updateStartEnabled();
+        showScreen(PAIRING);
     }
 
     private void selectPairedReceiver(PairedReceiver receiver, ReceiverDiscovery.Receiver discovered) {
@@ -503,6 +715,7 @@ public final class MainActivity extends Activity {
                     selectedHint.setText("Selected paired " + pairedReceiver.receiverName + " · " + pairedReceiver.host);
                     validation.setText("");
                     updatePairingUi(); refreshSelectedRows();
+                    showScreen(CONNECT);
                 });
             } catch (Exception e) {
                 runOnUiThread(() -> pairStatus.setText("Could not save the selected receiver. The previous selection is unchanged."));
@@ -540,7 +753,7 @@ public final class MainActivity extends Activity {
         else if (pairingStoreError != null) pairStatus.setText(pairingStoreError);
         else if (!pairedReceivers.isEmpty()) pairStatus.setText("Select a paired receiver from the list, or pair another Mac.");
         else pairStatus.setText("Pair this phone with a Mac to stop entering a code next time.");
-        pairButton.setEnabled(!paired && pairingStoreError == null);
+        pairButton.setEnabled(!paired && pairingStoreError == null && PairingProtocol.isValidPin(code.getText().toString()));
         updateStartEnabled();
     }
 
@@ -629,6 +842,7 @@ public final class MainActivity extends Activity {
                     selectedHint.setText("Paired with " + paired.receiverName + " · " + paired.host);
                     validation.setText("");
                     updatePairingUi();
+                    showScreen(CONNECT);
                 });
             } catch (Exception error) {
                 runOnUiThread(() -> {
@@ -761,11 +975,11 @@ public final class MainActivity extends Activity {
         }
         new AlertDialog.Builder(this).setTitle("Stop sending to change audio source?")
                 .setMessage("Stop the current capture and select " + app.label + "? You’ll need to press Start and approve a new Android capture session.")
-                .setNegativeButton("Keep sending", (dialog, which) -> picker.dismiss())
+                .setNegativeButton("Keep sending", (dialog, which) -> { if (picker != null) picker.dismiss(); })
                 .setPositiveButton("Stop and choose", (dialog, which) -> {
                     pendingCaptureApp = app;
                     pendingSourceChange = PENDING_SELECT_APP;
-                    picker.dismiss();
+                    if (picker != null) picker.dismiss();
                     startService(new Intent(this, AudioSenderService.class).setAction(AudioSenderService.ACTION_STOP));
                     setConnectionStatus("Stopping…");
                 }).show();
@@ -791,23 +1005,18 @@ public final class MainActivity extends Activity {
             return;
         }
 
-        LinearLayout content = new LinearLayout(this);
-        content.setOrientation(LinearLayout.VERTICAL);
-        content.setPadding(dp(20), 0, dp(20), 0);
-        EditText search = field("Search apps", InputType.TYPE_CLASS_TEXT);
-        content.addView(search, new LinearLayout.LayoutParams(-1, dp(52)));
-        TextView empty = text("No matching apps.", 15, false);
+        appPickerContent.removeAllViews();
+        TextView empty = text("No apps match this search.", 15, false);
         empty.setGravity(Gravity.CENTER);
-        content.addView(empty, new LinearLayout.LayoutParams(-1, dp(64)));
         ListView list = new ListView(this);
         AppPickerAdapter adapter = new AppPickerAdapter(apps);
         list.setAdapter(adapter);
         list.setEmptyView(empty);
         list.setFastScrollEnabled(true);
-        content.addView(list, new LinearLayout.LayoutParams(-1, dp(360)));
-        AlertDialog dialog = new AlertDialog.Builder(this).setTitle("Choose app")
-                .setView(content).setNegativeButton("Cancel", null).create();
-        search.addTextChangedListener(new TextWatcher() {
+        appPickerContent.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
+        appPickerContent.addView(empty, new LinearLayout.LayoutParams(-1, -2));
+        appSearchField.setText("");
+        appSearchField.addTextChangedListener(new TextWatcher() {
             @Override public void beforeTextChanged(CharSequence s, int start, int count, int after) { }
             @Override public void onTextChanged(CharSequence s, int start, int before, int count) { adapter.filter(s.toString()); }
             @Override public void afterTextChanged(Editable e) { }
@@ -816,7 +1025,7 @@ public final class MainActivity extends Activity {
             CaptureApp choice = adapter.getItem(position);
             if (choice == null) return;
             if (connectionActive) {
-                confirmSelectApp(choice, dialog);
+                confirmSelectApp(choice, null);
                 return;
             }
             selectedCaptureApp = choice;
@@ -825,9 +1034,9 @@ public final class MainActivity extends Activity {
             CaptureAppSelection.save(this, choice);
             validation.setText("");
             updateSourceModeUi();
-            dialog.dismiss();
+            showScreen(CONNECT);
         });
-        dialog.show();
+        showScreen(APP_PICKER);
     }
 
     private void showAppListUnavailable(String message) {
@@ -895,13 +1104,14 @@ public final class MainActivity extends Activity {
                         }
                         pairedReceiver = null;
                         pairedReceiverFound = false;
+                        updatePairingUi();
                         fillingFromDiscovery = true;
                         host.setText(pairing.host); host.setSelection(host.length());
                         code.setText(pairing.pin);
                         portChip.setText("Port\n50555");
                         selectedName = pairing.hasName ? pairing.name : null;
                         selectedHint.setText("Details filled for " + pairing.name + ". Press Start sending when ready.");
-                        validation.setText(""); refreshSelectedRows(); updateStartEnabled();
+                        validation.setText(""); refreshSelectedRows(); updateStartEnabled(); showScreen(PAIRING);
                     } catch (IllegalArgumentException e) {
                         validation.setText("This QR is not a supported LAN Audio pairing code.");
                     } finally { fillingFromDiscovery = false; }
@@ -954,40 +1164,71 @@ public final class MainActivity extends Activity {
         super.onRequestPermissionsResult(requestCode, permissions, results);
         if (requestCode == RECORD_REQUEST) {
             if (results.length > 0 && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) showCaptureConsent();
-            else if (connectionStatus != null) setConnectionStatus("Microphone permission is required by Android for playback capture; no mic audio is recorded.");
+            else if (connectionStatus != null) setConnectionStatus("Capture permission wasn’t granted. Tap Start to try again. Android requires microphone permission for playback capture; this app does not record mic audio.");
         }
     }
 
     @Override protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
         if (requestCode != CAPTURE_REQUEST) return;
-        if (resultCode != RESULT_OK || data == null) { setConnectionStatus("Capture permission denied."); return; }
+        if (resultCode != RESULT_OK || data == null) { setConnectionStatus("Capture permission wasn’t granted. Tap Start to try again."); return; }
         if (!selectedAppIsValid()) {
             setConnectionStatus("Selected app is no longer available. Choose it again before starting.");
             updateStartEnabled();
             return;
         }
+        activeSessionId = UUID.randomUUID().toString();
         Intent service = new Intent(this, AudioSenderService.class).setAction(AudioSenderService.ACTION_START)
                 .putExtra("host", pairedReceiver == null ? host.getText().toString().trim() : pairedReceiver.host)
+                .putExtra("sessionId", activeSessionId)
                 .putExtra("code", pairedReceiver == null ? code.getText().toString().trim() : "")
                 .putExtra("resultCode", resultCode).putExtra("projection", data);
         if (pairedReceiver != null) service.putExtra("pairedDeviceId", pairedReceiver.deviceId).putExtra("pairedToken", pairedReceiver.token);
         if (oneAppMode && selectedCaptureApp != null) service.putExtra("selectedUid", selectedCaptureApp.uid)
                 .putExtra("selectedPackage", selectedCaptureApp.packageName).putExtra("captureLabel", selectedCaptureApp.label);
+        activeSessionHost = pairedReceiver == null ? host.getText().toString().trim() : pairedReceiver.host;
+        activeSessionCaptureLabel = oneAppMode && selectedCaptureApp != null ? selectedCaptureApp.label : "All compatible apps";
         if (Build.VERSION.SDK_INT >= 26) startForegroundService(service); else startService(service);
         setConnectionStatus("Connecting…");
     }
 
     private void setConnectionStatus(String text) {
         if (connectionStatus == null) return;
+        boolean wasActive = connectionActive;
+        String previousStatus = statusMessage;
+        statusMessage = text == null ? "Stopped" : text;
         connectionStatus.setText(text == null ? "Stopped" : text);
         connectionActive = text != null && (text.startsWith("Connecting") || text.startsWith("Sending") || text.startsWith("Stopping"));
-        if (stopButton != null) stopButton.setEnabled(connectionActive);
+        if (stopButton != null) {
+            stopButton.setEnabled(connectionActive && (text == null || !text.startsWith("Stopping")));
+            stopButton.setText(text != null && text.startsWith("Stopping") ? "Stopping…" : "Stop sending");
+        }
+        updateStartEnabled();
         boolean sending = text != null && text.startsWith("Sending");
+        if (sending || text != null && text.startsWith("Connecting")) showScreen(SENDING);
+        else if ("Stopped".equals(text) || text != null && text.startsWith("Error:") || text != null && text.startsWith("Capture permission")) showScreen(CONNECT);
+        if (sendingStatus != null) sendingStatus.setText(statusMessage);
+        if (text != null && text.startsWith("Error:") && !failureDialogVisible) {
+            failureDialogVisible = true;
+            new AlertDialog.Builder(this).setTitle("Couldn’t send audio")
+                    .setMessage(text.substring("Error:".length()).trim())
+                    .setNegativeButton("Choose another Mac", (dialog, which) -> showScreen(CHOOSE_MAC))
+                    .setPositiveButton("Try again", (dialog, which) -> { failureDialogVisible = false; beginCapture(); })
+                    .setOnDismissListener(dialog -> failureDialogVisible = false).show();
+        }
         if (volumePanel != null) {
             volumePanel.setVisibility(sending ? View.VISIBLE : View.GONE);
-            if (sending) loadMacVolume();
-            else { confirmedVolume = -1; volumeStatus.setText("Connect to adjust Mac volume"); }
+            if (outputPanel != null) outputPanel.setVisibility(sending && pairedReceiver != null ? View.VISIBLE : View.GONE);
+            boolean enteringSending = sending && (!wasActive || !previousStatus.startsWith("Sending"));
+            if (enteringSending && !sendingControlsInitialized) {
+                sendingControlsInitialized = true;
+                if (pairedReceiver != null) loadOutputs(); else loadMacVolume();
+            } else if (!sending && !connectionActive) {
+                sendingControlsInitialized = false;
+                outputListRequestState.invalidate();
+                confirmedVolume = -1;
+                volumeStatus.setText("Connect to adjust Mac volume");
+            }
         }
         if ("Stopped".equals(text) && pendingSourceChange != PENDING_NONE) onSourceStopped();
         if ("Stopped".equals(text) && pendingUnpairAfterStop) {
@@ -996,14 +1237,128 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private void loadOutputs() {
+        PairedReceiver target = pairedReceiver;
+        if (target == null) return;
+        long requestId = outputListRequestState.begin(target.deviceId);
+        if (requestId == OutputListRequestState.NO_REQUEST) return;
+        String requestSessionId = activeSessionId;
+        outputStatus.setText("Loading iMac audio outputs…");
+        manageOutputButton.setEnabled(false);
+        controlExecutor.execute(() -> {
+            try {
+                List<PairedReceiverClient.AudioOutput> found = PairedReceiverClient.listOutputs(target);
+                runOnUiThread(() -> {
+                    if (!outputListRequestState.finish(requestId)
+                            || !ServiceStatePolicy.isCurrentSession(activeSessionId, requestSessionId)
+                            || !connectionActive || pairedReceiver == null || !pairedReceiver.deviceId.equals(target.deviceId)) return;
+                    audioOutputs = found;
+                    outputListNeedsRetry = false;
+                    outputControlsUnsupported = false;
+                    manageOutputButton.setText("Manage output");
+                    PairedReceiverClient.AudioOutput current = null;
+                    boolean otherAvailable = false;
+                    for (PairedReceiverClient.AudioOutput item : found) {
+                        if (item.isDefault) current = item;
+                        else if (item.selectable) otherAvailable = true;
+                    }
+                    selectedOutputUid = current == null ? null : current.uid;
+                    selectedOutputVolumeSettable = current != null && current.volumeSettable;
+                    if (current == null) {
+                        outputStatus.setText("Current output device unavailable.");
+                        volumeStatus.setText("Volume control isn’t available for this output.");
+                        volumeSlider.setEnabled(false); muteButton.setEnabled(false);
+                    } else {
+                        outputStatus.setText(current.name + (otherAvailable ? " · In use" : " · No other available output devices."));
+                        if (current.volumeReadable && current.volume != null) showConfirmedVolume(current.volume);
+                        else {
+                            volumeStatus.setText(current.volumeSettable ? "This output’s volume can’t be read, so the slider is unavailable." : "Volume control isn’t available for this output.");
+                            volumeSlider.setEnabled(false); muteButton.setEnabled(false);
+                        }
+                    }
+                    manageOutputButton.setEnabled(otherAvailable);
+                });
+            } catch (PairedReceiverClient.UnsupportedOutputControlsException unsupported) {
+                runOnUiThread(() -> {
+                    if (!outputListRequestState.finish(requestId)
+                            || !ServiceStatePolicy.isCurrentSession(activeSessionId, requestSessionId)
+                            || !connectionActive || pairedReceiver == null || !pairedReceiver.deviceId.equals(target.deviceId)) return;
+                    outputControlsUnsupported = true;
+                    outputListNeedsRetry = false;
+                    selectedOutputUid = null;
+                    outputStatus.setText("This Mac doesn’t support output selection. Default-output volume remains available.");
+                    manageOutputButton.setText("Manage output");
+                    manageOutputButton.setEnabled(false);
+                    loadMacVolume();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (!outputListRequestState.finish(requestId)
+                            || !ServiceStatePolicy.isCurrentSession(activeSessionId, requestSessionId)
+                            || !connectionActive || pairedReceiver == null || !pairedReceiver.deviceId.equals(target.deviceId)) return;
+                    outputListNeedsRetry = true;
+                    selectedOutputUid = null;
+                    outputStatus.setText("Couldn’t refresh the Mac’s output list. Default-output volume remains available; retry output discovery.");
+                    manageOutputButton.setText("Retry output discovery");
+                    manageOutputButton.setEnabled(true);
+                    loadMacVolume();
+                });
+            }
+        });
+    }
+
+    private void showOutputChoices() {
+        List<PairedReceiverClient.AudioOutput> choices = new ArrayList<>();
+        for (PairedReceiverClient.AudioOutput output : audioOutputs) if (output.selectable && !output.isDefault) choices.add(output);
+        if (choices.isEmpty()) { outputStatus.setText("No other available output devices."); return; }
+        String[] labels = new String[choices.size()];
+        for (int i = 0; i < choices.size(); i++) labels[i] = choices.get(i).name;
+        new AlertDialog.Builder(this).setTitle("Choose Mac output").setItems(labels, (dialog, which) -> {
+            PairedReceiverClient.AudioOutput output = choices.get(which);
+            new AlertDialog.Builder(this).setTitle("Change the Mac’s default output?")
+                    .setMessage("This changes sound output for the whole Mac, including other apps.")
+                    .setNegativeButton("Cancel", null)
+                    .setPositiveButton("Change output", (confirm, action) -> changeMacOutput(output)).show();
+        }).setNegativeButton("Cancel", null).show();
+    }
+
+    private void changeMacOutput(PairedReceiverClient.AudioOutput output) {
+        outputStatus.setText("Switching to " + output.name + "…");
+        manageOutputButton.setEnabled(false); volumeSlider.setEnabled(false); muteButton.setEnabled(false);
+        PairedReceiver target = pairedReceiver;
+        if (target == null) return;
+        String requestSessionId = activeSessionId;
+        controlExecutor.execute(() -> {
+            try {
+                PairedReceiverClient.OutputChange changed = PairedReceiverClient.setOutput(target, output.uid);
+                runOnUiThread(() -> {
+                    if (!ServiceStatePolicy.isCurrentSession(activeSessionId, requestSessionId)
+                            || !connectionActive || pairedReceiver == null || !pairedReceiver.deviceId.equals(target.deviceId)) return;
+                    outputStatus.setText(output.uid.equals(changed.uid) ? "Output changed to " + changed.name + ". Refreshing…" : "iMac confirmed a different output. Refreshing current route…");
+                    loadOutputs();
+                });
+            } catch (Exception e) {
+                runOnUiThread(() -> {
+                    if (!ServiceStatePolicy.isCurrentSession(activeSessionId, requestSessionId)
+                            || !connectionActive || pairedReceiver == null || !pairedReceiver.deviceId.equals(target.deviceId)) return;
+                    String reason = e.getMessage() == null ? "Receiver unavailable." : e.getMessage();
+                    outputStatus.setText("Couldn’t change the Mac’s output. Current output remains as previously confirmed. " + reason);
+                    manageOutputButton.setEnabled(true);
+                    if (confirmedVolume >= 0) { volumeSlider.setProgress(confirmedVolume); volumeValue.setText(confirmedVolume + "%"); volumeSlider.setEnabled(true); muteButton.setEnabled(true); }
+                });
+            }
+        });
+    }
+
     private void loadMacVolume() {
         String address = host.getText().toString().trim(), pin = code.getText().toString().trim();
-        volumeStatus.setText("Reading Mac volume…");
+        volumeStatus.setText("Reading iMac output volume…");
+        volumeRetryButton.setVisibility(View.GONE);
         volumeSlider.setEnabled(false); muteButton.setEnabled(false);
         controlExecutor.execute(() -> {
             try {
                 int value = (pairedReceiver == null ? RemoteControlClient.getVolume(address, pin)
-                        : PairedReceiverClient.getVolume(pairedReceiver)).volume;
+                        : PairedReceiverClient.getVolume(pairedReceiver, outputControlsUnsupported ? null : selectedOutputUid)).volume;
                 runOnUiThread(() -> showConfirmedVolume(value));
             } catch (Exception e) { runOnUiThread(() -> showVolumeError(e, false)); }
         });
@@ -1011,12 +1366,13 @@ public final class MainActivity extends Activity {
 
     private void requestVolume(int value) {
         if (!connectionActive) return;
+        volumeRetryButton.setVisibility(View.GONE);
         String address = host.getText().toString().trim(), pin = code.getText().toString().trim();
         volumeStatus.setText("Updating…");
         controlExecutor.execute(() -> {
             try {
                 RemoteControlClient.Result result = pairedReceiver == null ? RemoteControlClient.setVolume(address, pin, value)
-                        : PairedReceiverClient.setVolume(pairedReceiver, value);
+                        : PairedReceiverClient.setVolume(pairedReceiver, outputControlsUnsupported ? null : selectedOutputUid, value);
                 runOnUiThread(() -> showConfirmedVolume(result.volume));
             } catch (Exception e) { runOnUiThread(() -> showVolumeError(e, true)); }
         });
@@ -1027,10 +1383,13 @@ public final class MainActivity extends Activity {
         if (value > 0) lastAudibleVolume = value;
         volumeSlider.setProgress(value);
         volumeValue.setText(value + "%");
-        volumeSlider.setContentDescription("Mac speaker volume, " + value + " percent");
-        volumeStatus.setText("Mac output volume");
-        volumeSlider.setEnabled(connectionActive); muteButton.setEnabled(connectionActive);
+        volumeSlider.setContentDescription("iMac output volume, " + value + " percent");
+        volumeStatus.setText("Confirmed by iMac");
+        boolean canSet = pairedReceiver == null || outputControlsUnsupported || selectedOutputVolumeSettable;
+        volumeSlider.setEnabled(connectionActive && canSet); muteButton.setEnabled(connectionActive && canSet);
         muteButton.setText(value == 0 ? "Unmute" : "Mute");
+        muteButton.setContentDescription(value == 0 ? "Unmute iMac" : "Mute iMac");
+        volumeRetryButton.setVisibility(View.GONE);
     }
 
     private void showVolumeError(Exception error, boolean restoreLastConfirmed) {
@@ -1038,26 +1397,25 @@ public final class MainActivity extends Activity {
             volumeSlider.setProgress(confirmedVolume);
             volumeValue.setText(confirmedVolume + "%");
         }
-        volumeStatus.setText("Couldn’t change/read Mac volume: " + (error.getMessage() == null ? "receiver unavailable" : error.getMessage()));
+        volumeStatus.setText("Couldn’t change/read iMac volume: " + (error.getMessage() == null ? "receiver unavailable" : error.getMessage()));
         volumeSlider.setEnabled(false); muteButton.setEnabled(false);
+        volumeRetryButton.setEnabled(true); volumeRetryButton.setVisibility(View.VISIBLE);
     }
 
     private void updateStartEnabled() {
-        if (startButton != null) startButton.setEnabled(isLanAddress(host.getText().toString().trim())
+        boolean ready = isLanAddress(host.getText().toString().trim())
                 && (pairedReceiver != null || code.getText().toString().trim().matches("\\d{6}"))
-                && (!oneAppMode || (selectedCaptureApp != null && !staleAppSelection)));
+                && (!oneAppMode || (selectedCaptureApp != null && !staleAppSelection));
+        if (startButton != null) startButton.setEnabled(ready && !connectionActive);
+        if (readiness != null) {
+            String receiver = pairedReceiver != null ? pairedReceiver.receiverName : selectedName;
+            String source = oneAppMode && selectedCaptureApp != null ? selectedCaptureApp.label : "All compatible apps";
+            readiness.setText(ready ? "Ready · " + (receiver == null ? host.getText().toString().trim() : receiver) + " · " + source
+                    : "Choose a Mac and audio source to start.");
+        }
     }
 
-    private boolean isLanAddress(String value) {
-        if (!value.matches("[0-9a-fA-F:.%]+")) return false;
-        try {
-            InetAddress address = InetAddress.getByName(value);
-            if (address.isLoopbackAddress()) return false;
-            if (address.isLinkLocalAddress() || address.isSiteLocalAddress()) return true;
-            if (address instanceof Inet6Address) { byte first = address.getAddress()[0]; return (first & 0xfe) == 0xfc; }
-        } catch (Exception ignored) { }
-        return false;
-    }
+    private boolean isLanAddress(String value) { return ReceiverAddress.isPrivateOrLinkLocal(value); }
 
     private EditText field(String hint, int inputType) {
         EditText e = new EditText(this);
@@ -1076,6 +1434,14 @@ public final class MainActivity extends Activity {
         GradientDrawable d = new GradientDrawable();
         d.setColor(Color.WHITE); d.setCornerRadius(dp(15)); d.setStroke(dp(selected ? 2 : 1), selected ? Color.rgb(40, 105, 180) : Color.rgb(218, 222, 229));
         return d;
+    }
+
+    private LinearLayout card() {
+        LinearLayout panel = new LinearLayout(this);
+        panel.setOrientation(LinearLayout.VERTICAL);
+        panel.setPadding(dp(16), dp(12), dp(16), dp(12));
+        panel.setBackground(cardBackground(false));
+        return panel;
     }
 
     private LinearLayout.LayoutParams params(int width, int height) {

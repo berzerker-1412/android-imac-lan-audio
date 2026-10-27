@@ -6,6 +6,14 @@ import java.security.SecureRandom;
 import static org.junit.Assert.*;
 
 public final class PairingProtocolTest {
+    @Test public void pairingButtonPinValidationRequiresExactlySixDigits() {
+        assertTrue(PairingProtocol.isValidPin("123456"));
+        assertFalse(PairingProtocol.isValidPin("12345"));
+        assertFalse(PairingProtocol.isValidPin("1234567"));
+        assertFalse(PairingProtocol.isValidPin("12a456"));
+        assertFalse(PairingProtocol.isValidPin(null));
+    }
+
     @Test public void generatesFieldsWithProtocolLengthsAndAlphabet() {
         SecureRandom random = new SecureRandom();
         String id = PairingProtocol.newDeviceId(random), token = PairingProtocol.newToken(random);

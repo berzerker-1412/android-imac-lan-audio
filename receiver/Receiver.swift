@@ -13,6 +13,7 @@ private let audioSampleRate = 48_000.0
 private let audioChannels = 2
 private let listenPort: UInt16 = 50_555
 private let controlPort: UInt16 = 50_556
+private let maximumControlJSONLineBytes = 4096
 private let ringCapacityFrames = 12_000 // 250 ms at 48 kHz
 private let serviceType = "_openbot-lanaudio._tcp."
 private let servicePort: UInt16 = listenPort
@@ -204,6 +205,93 @@ private func testSystemVolumeCommand() -> Int32 {
         fputs("CoreAudio volume test unavailable: \(error)\n", stderr)
         return 1
     }
+}
+
+private func listOutputsCommand() -> Int32 {
+    do {
+        let outputs = try SystemVolume.outputs().map { output -> [String: Any] in
+            var value: [String: Any] = [
+                "uid": output.uid, "name": output.name, "is_default": output.isDefault,
+                "selectable": output.selectable, "volume_readable": output.volumeReadable,
+                "volume_settable": output.volumeSettable
+            ]
+            if let volume = output.volume { value["volume"] = volume }
+            return value
+        }
+        let data = try JSONSerialization.data(withJSONObject: outputs, options: [.prettyPrinted, .sortedKeys])
+        guard let text = String(data: data, encoding: .utf8) else { throw ReceiverError.audio("Could not encode output list") }
+        print(text)
+        return EXIT_SUCCESS
+    } catch {
+        fputs("Could not list audio outputs: \(error)\n", stderr)
+        return EXIT_FAILURE
+    }
+}
+
+private func testAudioRecoveryGateCommand() -> Int32 {
+    let queue = DispatchQueue(label: "com.openbot.lanaudio.test-recovery")
+    let lock = NSLock()
+    let completed = DispatchSemaphore(value: 0)
+    var recoveryCount = 0
+    let gate = AudioRecoveryGate(queue: queue, delay: .milliseconds(80)) {
+        lock.lock(); recoveryCount += 1; lock.unlock()
+        completed.signal()
+    }
+    gate.request()
+    gate.request()
+    guard completed.wait(timeout: .now() + 2) == .success else {
+        fputs("Audio recovery scheduling test failed: no recovery ran.\n", stderr)
+        gate.stop()
+        return EXIT_FAILURE
+    }
+    gate.stop()
+    gate.request()
+    Thread.sleep(forTimeInterval: 0.15)
+    lock.lock(); let count = recoveryCount; lock.unlock()
+    guard count == 1 else {
+        fputs("Audio recovery scheduling test failed: expected one coalesced recovery, got \(count).\n", stderr)
+        return EXIT_FAILURE
+    }
+
+    var retryPolicy = AudioRecoveryRetryPolicy()
+    let retryDelays = (0..<10).compactMap { _ in retryPolicy.nextRetryDelayMilliseconds() }
+    let expectedDelays = [250, 500, 1_000, 2_000, 4_000, 4_000, 4_000, 4_000]
+    guard retryDelays == expectedDelays,
+          retryPolicy.nextRetryDelayMilliseconds() == nil else {
+        fputs("Audio recovery retry policy test failed: unexpected bounded backoff schedule.\n", stderr)
+        return EXIT_FAILURE
+    }
+    retryPolicy.reset()
+    guard retryPolicy.nextRetryDelayMilliseconds() == 250 else {
+        fputs("Audio recovery retry policy test failed: reset did not restart backoff.\n", stderr)
+        return EXIT_FAILURE
+    }
+
+    let baseline = AudioRouteSignature(uid: "bluetooth-a", sampleRate: 48_000, channels: 2, isRunning: true)
+    let changed = AudioRouteSignature(uid: "bluetooth-b", sampleRate: 44_100, channels: 2, isRunning: true)
+    var notificationWindow = AudioRecoveryNotificationWindow()
+    let now = Date()
+    let windowEnd = now.addingTimeInterval(0.05)
+    notificationWindow.begin(until: windowEnd, expectedRoute: baseline)
+    guard notificationWindow.trailingVerificationDeadline(now: now) == windowEnd,
+          notificationWindow.trailingVerificationDeadline(now: now) == windowEnd,
+          notificationWindow.trailingVerificationDeadline(now: windowEnd.addingTimeInterval(0.001)) == nil,
+          notificationWindow.requiresRecovery(currentRoute: changed, engineIsRunning: true) else {
+        fputs("Audio recovery notification test failed: a delayed route change was lost.\n", stderr)
+        return EXIT_FAILURE
+    }
+    notificationWindow.begin(until: now.addingTimeInterval(-0.01), expectedRoute: baseline)
+    guard !notificationWindow.requiresRecovery(currentRoute: baseline, engineIsRunning: true) else {
+        fputs("Audio recovery notification test failed: unchanged engine-start notification caused a recovery loop.\n", stderr)
+        return EXIT_FAILURE
+    }
+    notificationWindow.begin(until: now.addingTimeInterval(-0.01), expectedRoute: baseline)
+    guard notificationWindow.requiresRecovery(currentRoute: baseline, engineIsRunning: false) else {
+        fputs("Audio recovery notification test failed: stopped engine was not retried.\n", stderr)
+        return EXIT_FAILURE
+    }
+    print("Audio route recovery: PASS (coalescing, shutdown, bounded retries, trailing route event, loop suppression, reset)")
+    return EXIT_SUCCESS
 }
 
 private func testPairingStoreCommand() -> Int32 {
@@ -561,15 +649,116 @@ private final class StereoRingBuffer {
     }
 }
 
+/// Coalesces engine and system-route notifications into one asynchronous recovery.
+private final class AudioRecoveryGate {
+    private let lock = NSLock()
+    private let queue: DispatchQueue
+    private let delay: DispatchTimeInterval
+    private let action: () -> Void
+    private var stopped = false
+    private var scheduled = false
+
+    init(queue: DispatchQueue, delay: DispatchTimeInterval = .milliseconds(150), action: @escaping () -> Void) {
+        self.queue = queue
+        self.delay = delay
+        self.action = action
+    }
+
+    func request(after requestedDelay: DispatchTimeInterval? = nil) {
+        lock.lock()
+        guard !stopped, !scheduled else { lock.unlock(); return }
+        scheduled = true
+        lock.unlock()
+        queue.asyncAfter(deadline: .now() + (requestedDelay ?? delay)) { [weak self] in self?.run() }
+    }
+
+    func stop() {
+        lock.lock()
+        stopped = true
+        lock.unlock()
+    }
+
+    private func run() {
+        lock.lock()
+        guard !stopped else { scheduled = false; lock.unlock(); return }
+        scheduled = false
+        lock.unlock()
+        action()
+    }
+}
+
+/// Eight bounded retries give slow route changes time to settle without an
+/// unbounded engine.start() loop. Delays are capped at four seconds.
+private struct AudioRecoveryRetryPolicy {
+    private let retryDelaysMilliseconds = [250, 500, 1_000, 2_000, 4_000, 4_000, 4_000, 4_000]
+    private(set) var retriesScheduled = 0
+
+    mutating func nextRetryDelayMilliseconds() -> Int? {
+        guard retriesScheduled < retryDelaysMilliseconds.count else { return nil }
+        defer { retriesScheduled += 1 }
+        return retryDelaysMilliseconds[retriesScheduled]
+    }
+
+    mutating func reset() {
+        retriesScheduled = 0
+    }
+}
+
+private struct AudioRouteSignature: Equatable {
+    let uid: String?
+    let sampleRate: Double
+    let channels: AVAudioChannelCount
+    let isRunning: Bool
+}
+
+/// Defers notifications emitted during engine restart, then verifies the route
+/// signature so late hardware changes are not discarded as self-notifications.
+private struct AudioRecoveryNotificationWindow {
+    private var until: Date?
+    private var expectedRoute: AudioRouteSignature?
+
+    mutating func begin(until deadline: Date, expectedRoute: AudioRouteSignature?) {
+        self.until = deadline
+        self.expectedRoute = expectedRoute
+    }
+
+    mutating func setExpectedRoute(_ route: AudioRouteSignature?) {
+        expectedRoute = route
+    }
+
+    func trailingVerificationDeadline(now: Date) -> Date? {
+        guard let until, now < until else { return nil }
+        return until
+    }
+
+    mutating func requiresRecovery(currentRoute: AudioRouteSignature?, engineIsRunning: Bool) -> Bool {
+        until = nil
+        guard let expectedRoute, let currentRoute else { return true }
+        return !engineIsRunning || currentRoute != expectedRoute
+    }
+}
+
 private final class AudioOutput {
     private let engine = AVAudioEngine()
     private let ring = StereoRingBuffer(capacityFrames: ringCapacityFrames)
+    private let engineQueue = DispatchQueue(label: "com.openbot.lanaudio.engine-recovery")
+    private var sourceNode: AVAudioSourceNode?
+    private var sourceFormat: AVAudioFormat?
+    private var configurationObserver: NSObjectProtocol?
+    private var defaultOutputListener: AudioObjectPropertyListenerBlock?
+    private var recoveryRetryPolicy = AudioRecoveryRetryPolicy()
+    private var notificationWindow = AudioRecoveryNotificationWindow()
+    private var trailingVerificationScheduled = false
+    private var isStopped = false
+    private var recoveryExhausted = false
+    private var recoveryGate: AudioRecoveryGate!
 
     init() throws {
         guard let audioFormat = AVAudioFormat(standardFormatWithSampleRate: audioSampleRate,
                                              channels: AVAudioChannelCount(audioChannels)) else {
             throw ReceiverError.audio("Could not create 48 kHz stereo audio format")
         }
+        sourceFormat = audioFormat
         let sharedRing = ring
         let source = AVAudioSourceNode(format: audioFormat) { _, _, frameCount, audioBufferList in
             let buffers = UnsafeMutableAudioBufferListPointer(audioBufferList)
@@ -590,16 +779,153 @@ private final class AudioOutput {
                               frameCount: Int(frameCount))
             return noErr
         }
+        sourceNode = source
         engine.attach(source)
         engine.connect(source, to: engine.outputNode, format: audioFormat)
+        engine.prepare()
+        recoveryGate = AudioRecoveryGate(queue: engineQueue) { [weak self] in
+            self?.recoverForOutputChange()
+        }
         try engine.start()
+        notificationWindow.setExpectedRoute(currentRouteSignature())
+        do { try installRouteListeners() }
+        catch { engine.stop(); throw error }
         let systemOutput = engine.outputNode.outputFormat(forBus: 0)
         status("System audio output: \(Int(systemOutput.sampleRate)) Hz, \(systemOutput.channelCount) channels")
     }
 
-    func stopEngine() {
+    private func installRouteListeners() throws {
+        configurationObserver = NotificationCenter.default.addObserver(
+            forName: .AVAudioEngineConfigurationChange, object: engine, queue: nil
+        ) { [weak self] _ in
+            self?.requestRouteRecovery()
+        }
+
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.requestRouteRecovery()
+        }
+        let result = AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
+                                                         &address, engineQueue, listener)
+        guard result == noErr else {
+            if let observer = configurationObserver {
+                NotificationCenter.default.removeObserver(observer)
+                configurationObserver = nil
+            }
+            throw ReceiverError.audio("Could not monitor default audio output changes (CoreAudio status \(result))")
+        }
+        defaultOutputListener = listener
+    }
+
+    private func recoverForOutputChange() {
+        guard let sourceNode, let sourceFormat else { return }
+        notificationWindow.begin(until: Date().addingTimeInterval(1.5), expectedRoute: nil)
         ring.clear()
         engine.stop()
+        engine.disconnectNodeOutput(sourceNode)
+        engine.connect(sourceNode, to: engine.outputNode, format: sourceFormat)
+        engine.prepare()
+        do {
+            try engine.start()
+            recoveryRetryPolicy.reset()
+            recoveryExhausted = false
+            notificationWindow.begin(until: Date().addingTimeInterval(1.5), expectedRoute: currentRouteSignature())
+            let format = engine.outputNode.outputFormat(forBus: 0)
+            status("Audio output changed; playback resumed at \(Int(format.sampleRate)) Hz, \(format.channelCount) channels")
+        } catch {
+            notificationWindow.begin(until: Date().addingTimeInterval(1.5), expectedRoute: currentRouteSignature())
+            if let delay = recoveryRetryPolicy.nextRetryDelayMilliseconds() {
+                let attempt = recoveryRetryPolicy.retriesScheduled
+                status("Audio output changed; playback restart failed (retry \(attempt)/8): \(error). Retrying in \(delay) ms.")
+                recoveryGate.request(after: .milliseconds(delay))
+            } else {
+                recoveryExhausted = true
+                status("Audio output changed; playback restart failed after 9 attempts: \(error). Change the Mac output again or restart the receiver to retry.")
+            }
+        }
+    }
+
+    private func requestRouteRecovery() {
+        engineQueue.async { [weak self] in
+            guard let self else { return }
+            self.handleRouteNotification()
+        }
+    }
+
+    private func handleRouteNotification() {
+        guard !isStopped else { return }
+        let now = Date()
+        if let deadline = notificationWindow.trailingVerificationDeadline(now: now) {
+            scheduleTrailingVerification(at: deadline)
+            return
+        }
+        if !notificationWindow.requiresRecovery(currentRoute: currentRouteSignature(),
+                                                engineIsRunning: engine.isRunning) {
+            return
+        }
+        scheduleRecoveryForVerifiedChange()
+    }
+
+    private func scheduleTrailingVerification(at deadline: Date) {
+        guard !trailingVerificationScheduled else { return }
+        trailingVerificationScheduled = true
+        engineQueue.asyncAfter(deadline: .now() + max(0, deadline.timeIntervalSinceNow)) { [weak self] in
+            guard let self else { return }
+            self.trailingVerificationScheduled = false
+            guard !self.isStopped else { return }
+            if let laterDeadline = self.notificationWindow.trailingVerificationDeadline(now: Date()) {
+                self.scheduleTrailingVerification(at: laterDeadline)
+                return
+            }
+            if self.notificationWindow.requiresRecovery(currentRoute: self.currentRouteSignature(),
+                                                        engineIsRunning: self.engine.isRunning) {
+                self.scheduleRecoveryForVerifiedChange()
+            }
+        }
+    }
+
+    private func scheduleRecoveryForVerifiedChange() {
+        if recoveryExhausted {
+            recoveryRetryPolicy.reset()
+            recoveryExhausted = false
+        }
+        recoveryGate.request()
+    }
+
+    private func currentRouteSignature() -> AudioRouteSignature? {
+        let format = engine.outputNode.outputFormat(forBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else { return nil }
+        return AudioRouteSignature(uid: try? CoreAudioHardwareAccess().defaultOutputUID(),
+                                   sampleRate: format.sampleRate,
+                                   channels: format.channelCount,
+                                   isRunning: engine.isRunning)
+    }
+
+    func stopEngine() {
+        recoveryGate.stop()
+        removeRouteListeners()
+        engineQueue.sync {
+            isStopped = true
+            ring.clear()
+            engine.stop()
+        }
+    }
+
+    private func removeRouteListeners() {
+        if let observer = configurationObserver {
+            NotificationCenter.default.removeObserver(observer)
+            configurationObserver = nil
+        }
+        if let listener = defaultOutputListener {
+            var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                     mScope: kAudioObjectPropertyScopeGlobal,
+                                                     mElement: kAudioObjectPropertyElementMain)
+            _ = AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject),
+                                                       &address, engineQueue, listener)
+            defaultOutputListener = nil
+        }
     }
 
     func enqueue(_ bytes: [UInt8], frameCount: Int) {
@@ -633,23 +959,106 @@ private enum ReceiverError: Error, CustomStringConvertible {
     }
 }
 
-private enum SystemVolume {
-    static func defaultOutputDevice() throws -> AudioDeviceID {
-        var address = AudioObjectPropertyAddress(
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain)
+private struct AudioOutputInfo: Equatable {
+    let uid: String
+    let name: String
+    let isDefault: Bool
+    let selectable: Bool
+    let volumeReadable: Bool
+    let volumeSettable: Bool
+    let volume: Int?
+}
+
+/// Keep protocol/control logic testable without changing the Mac's live audio route.
+private protocol AudioHardwareAccess {
+    func outputs() throws -> [AudioOutputInfo]
+    func defaultOutputUID() throws -> String
+    func setDefaultOutput(uid: String) throws -> String
+    func getVolume(uid: String?) throws -> Int
+    func setVolume(uid: String?, percent: Int) throws -> Int
+}
+
+private final class CoreAudioHardwareAccess: AudioHardwareAccess {
+    private let systemObject = AudioObjectID(kAudioObjectSystemObject)
+
+    private func property(_ selector: AudioObjectPropertySelector,
+                          scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal,
+                          element: AudioObjectPropertyElement = kAudioObjectPropertyElementMain) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(mSelector: selector, mScope: scope, mElement: element)
+    }
+
+    private func deviceIDs() throws -> [AudioDeviceID] {
+        var address = property(kAudioHardwarePropertyDevices)
+        var size: UInt32 = 0
+        var status = AudioObjectGetPropertyDataSize(systemObject, &address, 0, nil, &size)
+        guard status == noErr, size % UInt32(MemoryLayout<AudioDeviceID>.size) == 0 else {
+            throw ReceiverError.audio("Could not enumerate Core Audio devices (status \(status))")
+        }
+        var ids = [AudioDeviceID](repeating: AudioDeviceID(kAudioObjectUnknown),
+                                  count: Int(size) / MemoryLayout<AudioDeviceID>.size)
+        if size > 0 {
+            status = AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &ids)
+            guard status == noErr else {
+                throw ReceiverError.audio("Could not read Core Audio devices (status \(status))")
+            }
+        }
+        return ids
+    }
+
+    private func currentDeviceID() throws -> AudioDeviceID {
+        var address = property(kAudioHardwarePropertyDefaultOutputDevice)
         var device = AudioDeviceID(kAudioObjectUnknown)
         var size = UInt32(MemoryLayout<AudioDeviceID>.size)
-        let result = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject),
-                                                &address, 0, nil, &size, &device)
+        let result = AudioObjectGetPropertyData(systemObject, &address, 0, nil, &size, &device)
         guard result == noErr, device != AudioDeviceID(kAudioObjectUnknown) else {
             throw ReceiverError.audio("No default output device is available")
         }
         return device
     }
 
-    private static func volumeAddresses() -> [AudioObjectPropertyAddress] {
+    private func stringProperty(_ selector: AudioObjectPropertySelector, device: AudioDeviceID) -> String? {
+        var address = property(selector)
+        var value: CFString?
+        var size = UInt32(MemoryLayout<CFString?>.size)
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &value) == noErr else { return nil }
+        return value as String?
+    }
+
+    private func outputChannels(device: AudioDeviceID) -> UInt32? {
+        var address = property(kAudioDevicePropertyStreamConfiguration,
+                               scope: kAudioDevicePropertyScopeOutput)
+        var size: UInt32 = 0
+        guard AudioObjectGetPropertyDataSize(device, &address, 0, nil, &size) == noErr,
+              size >= UInt32(MemoryLayout<AudioBufferList>.size) else { return nil }
+        let storage = UnsafeMutableRawPointer.allocate(byteCount: Int(size), alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { storage.deallocate() }
+        guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, storage) == noErr else { return nil }
+        let list = storage.assumingMemoryBound(to: AudioBufferList.self)
+        return UnsafeMutableAudioBufferListPointer(list).reduce(UInt32(0)) { $0 + $1.mNumberChannels }
+    }
+
+    private func canBeDefaultOutput(device: AudioDeviceID) -> Bool {
+        var address = property(kAudioDevicePropertyDeviceCanBeDefaultDevice,
+                               scope: kAudioDevicePropertyScopeOutput)
+        var value: UInt32 = 0
+        var size = UInt32(MemoryLayout<UInt32>.size)
+        return AudioObjectGetPropertyData(device, &address, 0, nil, &size, &value) == noErr && value != 0
+    }
+
+    private func deviceID(uid: String, requireSelectable: Bool = false) throws -> AudioDeviceID {
+        for id in try deviceIDs() where id != AudioDeviceID(kAudioObjectUnknown) {
+            if stringProperty(kAudioDevicePropertyDeviceUID, device: id) == uid,
+               (outputChannels(device: id) ?? 0) > 0,
+               (!requireSelectable || canBeDefaultOutput(device: id)) {
+                return id
+            }
+        }
+        throw ReceiverError.audio(requireSelectable
+                                  ? "Output UID is missing or cannot be selected as default"
+                                  : "Output UID is missing or is not an available output")
+    }
+
+    private func volumeAddresses() -> [AudioObjectPropertyAddress] {
         [
             AudioObjectPropertyAddress(mSelector: kAudioDevicePropertyVolumeScalar,
                                        mScope: kAudioDevicePropertyScopeOutput,
@@ -660,23 +1069,26 @@ private enum SystemVolume {
         ]
     }
 
-    static func getPercent() throws -> Int {
-        let device = try defaultOutputDevice()
+    private func volumeValue(device: AudioDeviceID) -> (percent: Int?, settable: Bool) {
+        var isSettable = false
         for originalAddress in volumeAddresses() {
             var address = originalAddress
             guard AudioObjectHasProperty(device, &address) else { continue }
+            var canSet: DarwinBoolean = false
+            if AudioObjectIsPropertySettable(device, &address, &canSet) == noErr, canSet.boolValue {
+                isSettable = true
+            }
             var volume: Float32 = 0
             var size = UInt32(MemoryLayout<Float32>.size)
             let result = AudioObjectGetPropertyData(device, &address, 0, nil, &size, &volume)
             if result == noErr, volume.isFinite, (0.0...1.0).contains(volume) {
-                return Int((volume * 100.0).rounded())
+                return (Int((volume * 100.0).rounded()), isSettable)
             }
         }
-        throw ReceiverError.audio("Default output does not expose readable system volume")
+        return (nil, isSettable)
     }
 
-    static func setPercent(_ percent: Int) throws -> Int {
-        let device = try defaultOutputDevice()
+    private func setPercent(_ percent: Int, device: AudioDeviceID) throws -> Int {
         var lastStatus: OSStatus = noErr
         for originalAddress in volumeAddresses() {
             var address = originalAddress
@@ -687,12 +1099,177 @@ private enum SystemVolume {
             var volume = Float32(percent) / 100.0
             lastStatus = AudioObjectSetPropertyData(device, &address, 0, nil,
                                                     UInt32(MemoryLayout<Float32>.size), &volume)
-            if lastStatus == noErr { return try getPercent() }
+            if lastStatus == noErr {
+                var actualValue: Float32 = 0
+                var actualSize = UInt32(MemoryLayout<Float32>.size)
+                guard AudioObjectGetPropertyData(device, &address, 0, nil,
+                                                 &actualSize, &actualValue) == noErr,
+                      actualValue.isFinite, (0.0...1.0).contains(actualValue) else {
+                    throw ReceiverError.audio("Output volume was set but cannot be read back")
+                }
+                return Int((actualValue * 100.0).rounded())
+            }
         }
         if lastStatus != noErr {
             throw ReceiverError.audio("macOS rejected system volume change (CoreAudio status \(lastStatus))")
         }
-        throw ReceiverError.audio("Default output system volume is not settable")
+        throw ReceiverError.audio("Output system volume is not settable")
+    }
+
+    func outputs() throws -> [AudioOutputInfo] {
+        let current = try currentDeviceID()
+        var result: [AudioOutputInfo] = []
+        for id in try deviceIDs() where id != AudioDeviceID(kAudioObjectUnknown) {
+            guard (outputChannels(device: id) ?? 0) > 0,
+                  let uid = stringProperty(kAudioDevicePropertyDeviceUID, device: id),
+                  !uid.isEmpty else { continue }
+            let name = stringProperty(kAudioObjectPropertyName, device: id) ?? "Audio output"
+            let volume = volumeValue(device: id)
+            result.append(AudioOutputInfo(uid: uid, name: name, isDefault: id == current,
+                                          selectable: canBeDefaultOutput(device: id), volumeReadable: volume.percent != nil,
+                                          volumeSettable: volume.settable, volume: volume.percent))
+        }
+        return result.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    func defaultOutputUID() throws -> String {
+        let id = try currentDeviceID()
+        guard let uid = stringProperty(kAudioDevicePropertyDeviceUID, device: id), !uid.isEmpty else {
+            throw ReceiverError.audio("Default output does not expose a stable Core Audio UID")
+        }
+        return uid
+    }
+
+    func setDefaultOutput(uid: String) throws -> String {
+        let id = try deviceID(uid: uid, requireSelectable: true)
+        var address = property(kAudioHardwarePropertyDefaultOutputDevice)
+        var settable: DarwinBoolean = false
+        let check = AudioObjectIsPropertySettable(systemObject, &address, &settable)
+        guard check == noErr, settable.boolValue else {
+            throw ReceiverError.audio("macOS does not allow changing the default output")
+        }
+        var selected = id
+        let result = AudioObjectSetPropertyData(systemObject, &address, 0, nil,
+                                                UInt32(MemoryLayout<AudioDeviceID>.size), &selected)
+        guard result == noErr else {
+            throw ReceiverError.audio("macOS rejected output selection (CoreAudio status \(result))")
+        }
+        let actual = try defaultOutputUID()
+        guard actual == uid else { throw ReceiverError.audio("macOS selected a different default output") }
+        return actual
+    }
+
+    func getVolume(uid: String?) throws -> Int {
+        let id: AudioDeviceID
+        if let uid { id = try deviceID(uid: uid) } else { id = try currentDeviceID() }
+        guard let volume = volumeValue(device: id).percent else {
+            throw ReceiverError.audio("Output does not expose readable system volume")
+        }
+        return volume
+    }
+
+    func setVolume(uid: String?, percent: Int) throws -> Int {
+        let id: AudioDeviceID
+        if let uid { id = try deviceID(uid: uid) } else { id = try currentDeviceID() }
+        return try setPercent(percent, device: id)
+    }
+}
+
+private enum SystemVolume {
+    private static let hardware: AudioHardwareAccess = CoreAudioHardwareAccess()
+    static func defaultOutputDevice() throws -> AudioDeviceID {
+        // Retained only for the legacy UI status name; use the hardware API for control.
+        var address = AudioObjectPropertyAddress(mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+                                                 mScope: kAudioObjectPropertyScopeGlobal,
+                                                 mElement: kAudioObjectPropertyElementMain)
+        var device = AudioDeviceID(kAudioObjectUnknown)
+        var size = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let result = AudioObjectGetPropertyData(AudioObjectID(kAudioObjectSystemObject), &address, 0, nil, &size, &device)
+        guard result == noErr, device != AudioDeviceID(kAudioObjectUnknown) else {
+            throw ReceiverError.audio("No default output device is available")
+        }
+        return device
+    }
+    static func getPercent() throws -> Int { try hardware.getVolume(uid: nil) }
+    static func setPercent(_ percent: Int) throws -> Int { try hardware.setVolume(uid: nil, percent: percent) }
+    static func outputs() throws -> [AudioOutputInfo] { try hardware.outputs() }
+    static func selectOutput(uid: String) throws -> String { try hardware.setDefaultOutput(uid: uid) }
+    static func getPercent(uid: String?) throws -> Int { try hardware.getVolume(uid: uid) }
+    static func setPercent(_ percent: Int, uid: String?) throws -> Int { try hardware.setVolume(uid: uid, percent: percent) }
+}
+
+private final class FakeAudioHardwareAccess: AudioHardwareAccess {
+    private let lock = NSLock()
+    private var selectedUID = "fake-output-a"
+    private var volumes = ["fake-output-a": 37, "fake-output-b": 64, "fake-output-meter": 55]
+    private let definitions: [AudioOutputInfo]
+
+    init(outputCount: Int = 4) {
+        var devices = [
+            AudioOutputInfo(uid: "fake-output-a", name: "Test Output A", isDefault: true,
+                            selectable: true, volumeReadable: true, volumeSettable: true, volume: 37),
+            AudioOutputInfo(uid: "fake-output-b", name: "Test Output B", isDefault: false,
+                            selectable: true, volumeReadable: true, volumeSettable: true, volume: 64),
+            AudioOutputInfo(uid: "fake-output-meter", name: "Test Meter Output", isDefault: false,
+                            selectable: false, volumeReadable: true, volumeSettable: true, volume: 55),
+            AudioOutputInfo(uid: "fake-output-fixed", name: "Test Fixed Output", isDefault: false,
+                            selectable: true, volumeReadable: false, volumeSettable: false, volume: nil)
+        ]
+        if outputCount > devices.count {
+            for index in devices.count..<outputCount {
+                let uid = "fake-" + String(repeating: "u", count: 48) + "-\(index)"
+                let name = "Test Output " + String(repeating: "N", count: 88) + "-\(index)"
+                devices.append(AudioOutputInfo(uid: uid, name: name, isDefault: false,
+                                               selectable: true, volumeReadable: true,
+                                               volumeSettable: true, volume: 50))
+                volumes[uid] = 50
+            }
+        }
+        definitions = devices
+    }
+
+    func outputs() throws -> [AudioOutputInfo] {
+        lock.lock(); defer { lock.unlock() }
+        return definitions.map { item in
+            AudioOutputInfo(uid: item.uid, name: item.name, isDefault: item.uid == selectedUID,
+                            selectable: item.selectable, volumeReadable: item.volumeReadable,
+                            volumeSettable: item.volumeSettable, volume: volumes[item.uid])
+        }
+    }
+    func defaultOutputUID() throws -> String {
+        lock.lock(); defer { lock.unlock() }; return selectedUID
+    }
+    func setDefaultOutput(uid: String) throws -> String {
+        lock.lock(); defer { lock.unlock() }
+        guard definitions.contains(where: { $0.uid == uid && $0.selectable }) else {
+            throw ReceiverError.audio("Output UID is missing or cannot be selected")
+        }
+        selectedUID = uid
+        return selectedUID
+    }
+    func getVolume(uid: String?) throws -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let selected = uid ?? selectedUID
+        guard let definition = definitions.first(where: { $0.uid == selected }) else {
+            throw ReceiverError.audio("Output UID is missing or is not an available output")
+        }
+        guard definition.volumeReadable, let volume = volumes[selected] else {
+            throw ReceiverError.audio("Output does not expose readable system volume")
+        }
+        return volume
+    }
+    func setVolume(uid: String?, percent: Int) throws -> Int {
+        lock.lock(); defer { lock.unlock() }
+        let selected = uid ?? selectedUID
+        guard let definition = definitions.first(where: { $0.uid == selected }) else {
+            throw ReceiverError.audio("Output UID is missing or is not an available output")
+        }
+        guard definition.volumeSettable else {
+            throw ReceiverError.audio("Output system volume is not settable")
+        }
+        guard (0...100).contains(percent) else { throw ReceiverError.audio("Volume must be 0–100") }
+        volumes[selected] = percent
+        return percent
     }
 }
 
@@ -844,7 +1421,8 @@ private func validInteger(_ value: Any?) -> Int? {
 }
 
 private func serveControl(from client: Int32, pin: String, limiter: PINAttemptLimiter,
-                          pairings: PairingStore) {
+                          pairings: PairingStore,
+                          hardware: AudioHardwareAccess = CoreAudioHardwareAccess()) {
     var timeout = timeval(tv_sec: 2, tv_usec: 0)
     _ = setsockopt(client, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
     _ = setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
@@ -935,16 +1513,74 @@ private func serveControl(from client: Int32, pin: String, limiter: PINAttemptLi
             }
             sendJSONLine(["id": requestID, "ok": true], to: client)
         case "get_volume":
-            let volume = try SystemVolume.getPercent()
-            sendJSONLine(["id": requestID, "ok": true, "volume": volume], to: client)
+            let outputUID = request["output_uid"] as? String
+            if request["output_uid"] != nil, (protocolName != "LANCTRL2" || outputUID == nil) {
+                sendJSONLine(["id": requestID, "ok": false,
+                              "error": "output_uid requires LANCTRL2 and must be a string"], to: client)
+                return
+            }
+            let volume = try hardware.getVolume(uid: outputUID)
+            var response: [String: Any] = ["id": requestID, "ok": true, "volume": volume]
+            if protocolName == "LANCTRL2" {
+                response["output_uid"] = try outputUID ?? hardware.defaultOutputUID()
+            }
+            sendJSONLine(response, to: client)
         case "set_volume":
             guard let value = validInteger(request["value"]), (0...100).contains(value) else {
                 sendJSONLine(["id": requestID, "ok": false,
                               "error": "value must be an integer from 0 to 100"], to: client)
                 return
             }
-            let volume = try SystemVolume.setPercent(value)
-            sendJSONLine(["id": requestID, "ok": true, "volume": volume], to: client)
+            let outputUID = request["output_uid"] as? String
+            if request["output_uid"] != nil, (protocolName != "LANCTRL2" || outputUID == nil) {
+                sendJSONLine(["id": requestID, "ok": false,
+                              "error": "output_uid requires LANCTRL2 and must be a string"], to: client)
+                return
+            }
+            let volume = try hardware.setVolume(uid: outputUID, percent: value)
+            var response: [String: Any] = ["id": requestID, "ok": true, "volume": volume]
+            if protocolName == "LANCTRL2" {
+                response["output_uid"] = try outputUID ?? hardware.defaultOutputUID()
+            }
+            sendJSONLine(response, to: client)
+        case "list_outputs":
+            guard protocolName == "LANCTRL2" else {
+                sendJSONLine(["id": requestID, "ok": false,
+                              "error": "list_outputs requires paired LANCTRL2 authentication"], to: client)
+                return
+            }
+            let outputs = try hardware.outputs().map { output -> [String: Any] in
+                var value: [String: Any] = [
+                    "uid": output.uid, "name": output.name, "is_default": output.isDefault,
+                    "selectable": output.selectable, "volume_readable": output.volumeReadable,
+                    "volume_settable": output.volumeSettable
+                ]
+                if let percent = output.volume { value["volume"] = percent }
+                return value
+            }
+            let response: [String: Any] = ["id": requestID, "ok": true, "outputs": outputs]
+            let responseData = try JSONSerialization.data(withJSONObject: response, options: [.sortedKeys])
+            guard responseData.count <= maximumControlJSONLineBytes else {
+                sendJSONLine(["id": requestID, "ok": false,
+                              "error": "output list exceeds the 4096-byte response limit"], to: client)
+                return
+            }
+            sendJSONLine(response, to: client)
+        case "set_output":
+            guard protocolName == "LANCTRL2" else {
+                sendJSONLine(["id": requestID, "ok": false,
+                              "error": "set_output requires paired LANCTRL2 authentication"], to: client)
+                return
+            }
+            guard let uid = request["output_uid"] as? String, !uid.isEmpty, uid.utf8.count <= 256 else {
+                sendJSONLine(["id": requestID, "ok": false,
+                              "error": "output_uid must be a non-empty string up to 256 bytes"], to: client)
+                return
+            }
+            let selectedUID = try hardware.setDefaultOutput(uid: uid)
+            let output = try hardware.outputs().first(where: { $0.uid == selectedUID })
+            sendJSONLine(["id": requestID, "ok": true, "output_uid": selectedUID,
+                          "name": output?.name ?? "Audio output"], to: client)
         default:
             sendJSONLine(["id": requestID, "ok": false, "error": "unsupported command"], to: client)
         }
@@ -1176,6 +1812,7 @@ private func runControlTestServer() throws {
     let limiter = PINAttemptLimiter()
     let pairingsURL = directory.appendingPathComponent("test-paired-devices.json")
     let pairings = PairingStore(url: pairingsURL)
+    let testHardware = FakeAudioHardwareAccess(outputCount: 15)
     defer { try? FileManager.default.removeItem(at: pairingsURL) }
     var pollDescriptor = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
     while !stopState.isStopped {
@@ -1192,7 +1829,8 @@ private func runControlTestServer() throws {
             if stopState.isStopped { break }
             throw ReceiverError.system("accept control test client", errno)
         }
-        serveControl(from: client, pin: pin, limiter: limiter, pairings: pairings)
+        serveControl(from: client, pin: pin, limiter: limiter, pairings: pairings,
+                     hardware: testHardware)
         close(client)
     }
 }
@@ -1323,6 +1961,8 @@ func runReceiverCLI(arguments: [String]) -> Int32 {
         case "--remove-qr": return removeQRCommand()
         case "--test-qr": return showQRCommand(testOnly: true)
         case "--test-volume": return testSystemVolumeCommand()
+        case "--list-outputs": return listOutputsCommand()
+        case "--test-audio-recovery-gate": return testAudioRecoveryGateCommand()
         case "--test-pairing-store": return testPairingStoreCommand()
         case "--test-control-server":
             do { try runControlTestServer(); return EXIT_SUCCESS }
@@ -1338,6 +1978,6 @@ func runReceiverCLI(arguments: [String]) -> Int32 {
             return EXIT_FAILURE
         }
     }
-    fputs("Usage: android-imac-audio-receiver [--status|--show-qr|--remove-qr|--test-qr|--test-volume|--test-pairing-store|--test-control-server]\n", stderr)
+    fputs("Usage: android-imac-audio-receiver [--status|--show-qr|--remove-qr|--test-qr|--test-volume|--list-outputs|--test-audio-recovery-gate|--test-pairing-store|--test-control-server]\n", stderr)
     return EX_USAGE
 }

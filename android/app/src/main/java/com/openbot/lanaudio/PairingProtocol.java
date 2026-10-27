@@ -19,8 +19,10 @@ final class PairingProtocol {
         return new String(result);
     }
 
+    static boolean isValidPin(String pin) { return pin != null && pin.matches("\\d{6}"); }
+
     static void validatePairFields(String pin, String deviceId, String name, String token) {
-        if (pin == null || !pin.matches("\\d{6}")) throw new IllegalArgumentException("Enter the 6-digit pairing code.");
+        if (!isValidPin(pin)) throw new IllegalArgumentException("Enter the 6-digit pairing code.");
         if (deviceId == null || !deviceId.matches("[A-Za-z0-9_-]{16,64}")) throw new IllegalArgumentException("Invalid phone device ID.");
         int nameBytes = name == null ? 0 : name.getBytes(StandardCharsets.UTF_8).length;
         if (nameBytes < 1 || nameBytes > 80 || name.indexOf('\n') >= 0 || name.indexOf('\r') >= 0) throw new IllegalArgumentException("Invalid phone name.");

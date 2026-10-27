@@ -5,6 +5,8 @@ import android.net.wifi.WifiManager;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Looper;
 import java.net.Inet6Address;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
@@ -37,10 +39,24 @@ final class ReceiverDiscovery {
     private final Listener listener;
     private final WifiManager.MulticastLock multicastLock;
     private final Executor mainExecutor;
+    private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final Object servicesLock = new Object();
     private final Map<String, Boolean> resolving = new HashMap<>();
     private final Map<String, NsdServiceInfo> services = new HashMap<>();
     private NsdManager.DiscoveryListener discoveryListener;
     private boolean restartAfterStop;
+
+    private void notifyState(String state) {
+        mainHandler.post(() -> listener.onState(state));
+    }
+
+    private void notifyReceiver(Receiver receiver) {
+        mainHandler.post(() -> listener.onReceiver(receiver));
+    }
+
+    private void notifyReceiverLost(String name) {
+        mainHandler.post(() -> listener.onReceiverLost(name));
+    }
 
     ReceiverDiscovery(Context context, Listener listener) {
         this.nsd = (NsdManager) context.getSystemService(Context.NSD_SERVICE);
@@ -53,65 +69,67 @@ final class ReceiverDiscovery {
 
     void start() {
         if (discoveryListener != null) return;
-        if (nsd == null) { listener.onState("Discovery unavailable"); return; }
+        if (nsd == null) { notifyState("Discovery unavailable"); return; }
         if (multicastLock != null && !multicastLock.isHeld()) multicastLock.acquire();
-        resolving.clear();
-        services.clear();
+        synchronized (servicesLock) { resolving.clear(); services.clear(); }
         NsdManager.DiscoveryListener current = new NsdManager.DiscoveryListener() {
-            @Override public void onDiscoveryStarted(String type) { listener.onState("Searching for iMac receivers…"); }
+            @Override public void onDiscoveryStarted(String type) { notifyState("Searching for iMac receivers…"); }
             @Override public void onServiceFound(NsdServiceInfo service) {
                 if (!sameType(service.getServiceType())) return;
                 String name = service.getServiceName();
-                if (services.containsKey(name) || resolving.putIfAbsent(name, true) != null) return;
-                services.put(name, service);
-                listener.onReceiver(new Receiver(name, "", PORT, "Resolving…"));
+                synchronized (servicesLock) {
+                    if (services.containsKey(name) || resolving.putIfAbsent(name, true) != null) return;
+                    services.put(name, service);
+                }
+                notifyReceiver(new Receiver(name, "", PORT, "Resolving…"));
                 NsdManager.ResolveListener resolved = new NsdManager.ResolveListener() {
                     @Override public void onServiceResolved(NsdServiceInfo info) {
-                        resolving.remove(name);
+                        synchronized (servicesLock) { resolving.remove(name); }
                         String version = txt(info, "v");
                         InetAddress address = info.getHost();
                         int port = info.getPort();
                         if (!"1".equals(version)) {
-                            services.remove(name);
-                            listener.onReceiverLost(name);
+                            synchronized (servicesLock) { services.remove(name); }
+                            notifyReceiverLost(name);
                         } else if (port != PORT || address == null || !isLanAddress(address)) {
-                            services.remove(name);
-                            listener.onReceiverLost(name);
+                            synchronized (servicesLock) { services.remove(name); }
+                            notifyReceiverLost(name);
                         } else {
-                            listener.onReceiver(new Receiver(name, address.getHostAddress(), port, "Available"));
+                            notifyReceiver(new Receiver(name, address.getHostAddress(), port, "Available"));
                         }
                     }
                     @Override public void onResolveFailed(NsdServiceInfo info, int errorCode) {
-                        resolving.remove(name);
-                        listener.onReceiver(new Receiver(name, "", PORT, "Couldn’t resolve"));
+                        synchronized (servicesLock) { resolving.remove(name); }
+                        notifyReceiver(new Receiver(name, "", PORT, "Couldn’t resolve"));
                     }
                 };
                 try {
                     if (Build.VERSION.SDK_INT >= 33) nsd.resolveService(service, mainExecutor, resolved);
                     else nsd.resolveService(service, resolved);
                 } catch (IllegalArgumentException e) {
-                    resolving.remove(name);
-                    listener.onReceiver(new Receiver(name, "", PORT, "Couldn’t resolve"));
+                    synchronized (servicesLock) { resolving.remove(name); }
+                    notifyReceiver(new Receiver(name, "", PORT, "Couldn’t resolve"));
                 }
             }
             @Override public void onServiceLost(NsdServiceInfo service) {
                 String name = service.getServiceName();
-                resolving.remove(name);
-                services.remove(name);
-                listener.onReceiverLost(name);
+                synchronized (servicesLock) { resolving.remove(name); services.remove(name); }
+                notifyReceiverLost(name);
             }
-            @Override public void onDiscoveryStopped(String type) { finish(this); }
+            @Override public void onDiscoveryStopped(String type) { mainHandler.post(() -> finish(this)); }
             @Override public void onStartDiscoveryFailed(String type, int errorCode) {
-                listener.onState("Discovery failed (" + errorCode + ")");
-                stopInternal(this);
+                mainHandler.post(() -> {
+                    listener.onState("Discovery failed (" + errorCode + ")");
+                    stopInternal(this);
+                });
             }
             @Override public void onStopDiscoveryFailed(String type, int errorCode) {
-                listener.onState("Could not stop discovery (" + errorCode + ")");
+                notifyState("Could not stop discovery (" + errorCode + ")");
             }
         };
         discoveryListener = current;
         try { nsd.discoverServices(SERVICE_TYPE, NsdManager.PROTOCOL_DNS_SD, current); }
-        catch (IllegalArgumentException e) { stopInternal(current); listener.onState("Discovery unavailable"); }
+        catch (IllegalArgumentException e) { stopInternal(current); notifyState("Discovery unavailable"); }
     }
 
     void stop() {
@@ -131,30 +149,33 @@ final class ReceiverDiscovery {
     }
 
     void retry(String name) {
-        NsdServiceInfo service = services.get(name);
-        if (service == null || resolving.putIfAbsent(name, true) != null) return;
-        listener.onReceiver(new Receiver(name, "", PORT, "Resolving…"));
+        NsdServiceInfo service;
+        synchronized (servicesLock) {
+            service = services.get(name);
+            if (service == null || resolving.putIfAbsent(name, true) != null) return;
+        }
+        notifyReceiver(new Receiver(name, "", PORT, "Resolving…"));
         NsdManager.ResolveListener resolved = new NsdManager.ResolveListener() {
             @Override public void onServiceResolved(NsdServiceInfo info) {
-                resolving.remove(name);
+                synchronized (servicesLock) { resolving.remove(name); }
                 InetAddress address = info.getHost();
                 int port = info.getPort();
                 if (!"1".equals(txt(info, "v")) || port != PORT || address == null || !isLanAddress(address)) {
-                    services.remove(name);
-                    listener.onReceiverLost(name);
-                } else listener.onReceiver(new Receiver(name, address.getHostAddress(), port, "Available"));
+                    synchronized (servicesLock) { services.remove(name); }
+                    notifyReceiverLost(name);
+                } else notifyReceiver(new Receiver(name, address.getHostAddress(), port, "Available"));
             }
             @Override public void onResolveFailed(NsdServiceInfo info, int errorCode) {
-                resolving.remove(name);
-                listener.onReceiver(new Receiver(name, "", PORT, "Couldn’t resolve"));
+                synchronized (servicesLock) { resolving.remove(name); }
+                notifyReceiver(new Receiver(name, "", PORT, "Couldn’t resolve"));
             }
         };
         try {
             if (Build.VERSION.SDK_INT >= 33) nsd.resolveService(service, mainExecutor, resolved);
             else nsd.resolveService(service, resolved);
         } catch (IllegalArgumentException e) {
-            resolving.remove(name);
-            listener.onReceiver(new Receiver(name, "", PORT, "Couldn’t resolve"));
+            synchronized (servicesLock) { resolving.remove(name); }
+            notifyReceiver(new Receiver(name, "", PORT, "Couldn’t resolve"));
         }
     }
 
